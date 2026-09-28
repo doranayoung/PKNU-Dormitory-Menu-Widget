@@ -2,9 +2,9 @@
 // icon-color: orange; icon-glyph: utensils;
  
 /**
- * PKNU(국립부경대학교) 학생생활관 세종관 식단 위젯 — 2026 재작성판 (+캐싱)
+ * PKNU(국립부경대학교) 학생생활관 세종기숙사 식단 위젯 — 2026 재작성판 (+캐싱)
  * -------------------------------------------------------------
- * 출처: https://dormitory.pknu.ac.kr/03_notice/notice01.php (오늘의 식단, 세종관)
+ * 출처: https://dormitory.pknu.ac.kr/03_notice/notice01.php (오늘의 식단, 세종기숙사)
  *
  * 이 사이트는 정적 HTML에 식단이 바로 들어있지 않고, 페이지 로드 시
  * jQuery로 아래 엔드포인트에 AJAX POST 요청을 보내 실제 식단표를 받아온 뒤
@@ -24,18 +24,19 @@
  * 확인했다.
  *
  * ── 캐싱 ──────────────────────────────────────────────────────
- * 위젯이 열릴 때마다 매번 크롤링하지 않도록, 오늘 날짜(KST) 기준으로
- * 하루 한 번만 서버에 요청하고 결과를 로컬 파일에 저장해둔다. 같은 날
- * 안에서 위젯이 다시 열리면 그 캐시를 그대로 쓰므로 인터넷 없이도 뜬다.
- * 날짜가 바뀌면 캐시를 버리고 새로 크롤링하는데, 이때 마침 인터넷이
- * 없으면(사용자 선택에 따라) 오래된 캐시를 보여주는 대신 "인터넷 연결
- * 없음" 상태를 그대로 보여준다. 캐시 파일은 하나만 계속 덮어쓰는
- * 방식이라 용량이 누적되지 않고 항상 수 KB 수준으로 고정된다.
+ * 위젯을 열 때마다 항상 서버에 새로 요청한다 (학교가 식단을 중간에
+ * 수정해도 바로 반영되도록). 성공하면 그 결과를 로컬 파일에 덮어써
+ * 두고, 이 요청이 인터넷 문제로 실패했을 때만 마지막으로 저장해둔
+ * 캐시를 대신 보여준다 — 이때 그 캐시가 오늘 것인지 며칠 전 것인지도
+ * 같이 표시해서 오늘 식단으로 착각하지 않게 한다. 캐시조차 하나도
+ * 없으면(최초 실행 + 그 순간 인터넷도 없음) "인터넷 연결 없음" 상태를
+ * 보여준다. 캐시 파일은 하나만 계속 덮어쓰는 방식이라 용량이 누적되지
+ * 않고 항상 수 KB 수준으로 고정된다.
  */
  
 const AJAX_URL = "https://dormitory.pknu.ac.kr/03_notice/req_getSchedule.php";
 const REFERER_URL = "https://dormitory.pknu.ac.kr/03_notice/notice01.php";
-// 위젯 파라미터로 다른 bid를 넘기면(예: 다른 캠퍼스 식당) 그걸 쓰고, 없으면 세종관(foodE) 기본값 사용
+// 위젯 파라미터로 다른 bid를 넘기면(예: 다른 캠퍼스 식당) 그걸 쓰고, 없으면 세종기숙사(foodE) 기본값 사용
 const BID = (typeof args !== "undefined" && args.widgetParameter) ? args.widgetParameter : "foodE";
  
 // ---------------------------------------------------------------
@@ -209,26 +210,33 @@ async function fetchTodayMenuFromServer(today) {
 }
  
 // ---------------------------------------------------------------
-// 오늘 메뉴 가져오기 (캐시 우선)
-//  - 오늘자 캐시가 있으면 네트워크 요청 없이 그대로 반환
-//  - 없으면(날짜가 바뀌었거나 최초 실행) 크롤링해서 캐시에 저장
-//  - 그 크롤링이 인터넷 문제로 실패하면 networkError 상태를 반환
-//    (오래된 캐시로 대체하지 않음 — 사용자가 선택한 동작)
+// 오늘 메뉴 가져오기 (매번 새로 크롤링, 캐시는 실패했을 때의 대비용)
+//  - 위젯이 열릴 때마다 항상 서버에 새로 요청한다 (학교가 중간에 식단을
+//    수정해도 바로 반영되도록). 그 결과는 매번 캐시에 덮어써 둔다.
+//  - 이번 요청이 인터넷 문제로 실패하면, 그제서야 마지막으로 저장해둔
+//    캐시를 대신 보여준다(완전히 깜깜한 화면보다 나으니까). 이때는
+//    캐시가 "오늘 것인지 며칠 전 것인지"를 같이 표시해서 오해가 없게 한다.
+//  - 캐시조차 하나도 없으면(최초 실행 + 인터넷 없음) 그제서야 "인터넷
+//    연결 없음" 상태를 보여준다.
 // ---------------------------------------------------------------
 async function getTodayMenu() {
   const today = getKSTToday();
   const todayKey = dateKeyOf(today);
- 
-  const cached = loadCache();
-  if (cached && cached.dateKey === todayKey) {
-    return { ...cached.menu, fromCache: true };
-  }
  
   try {
     const menu = await fetchTodayMenuFromServer(today);
     saveCache(todayKey, menu);
     return { ...menu, fromCache: false };
   } catch (e) {
+    const cached = loadCache();
+    if (cached) {
+      return {
+        ...cached.menu,
+        fromCache: true,
+        cachedDateKey: cached.dateKey,
+        isStale: cached.dateKey !== todayKey
+      };
+    }
     return {
       networkError: true,
       dateLabel: `${today.month}/${today.day}`
@@ -246,7 +254,7 @@ async function createWidget(menu) {
  
   const titleStack = w.addStack();
   titleStack.centerAlignContent();
-  const title = titleStack.addText("🍽 세종관 오늘의 식단");
+  const title = titleStack.addText("🍽 세종기숙사 오늘의 식단");
   title.font = Font.boldSystemFont(14);
   title.textColor = Color.white();
   titleStack.addSpacer();
@@ -262,7 +270,7 @@ async function createWidget(menu) {
     msg1.font = Font.boldSystemFont(13);
     msg1.textColor = Color.white();
     w.addSpacer(4);
-    const msg2 = w.addText("오늘 식단을 아직 못 가져왔어요.\n인터넷에 연결한 뒤 다시 열어보세요.");
+    const msg2 = w.addText("오늘 식단을 아직 못 가져왔어요.\n인터넷에 연결한 뒤 다시 시도해보세요.");
     msg2.font = Font.systemFont(11);
     msg2.textColor = new Color("#8e8e93");
     msg2.lineLimit = 3;
@@ -310,8 +318,10 @@ async function createWidget(menu) {
   let footerText;
   if (!menu.found) {
     footerText = "이번 주 식단 정보 없음 (방학/미운영 가능)";
+  } else if (menu.fromCache && menu.isStale) {
+    footerText = `⚠️ ${menu.cachedDateKey.split("-").slice(1).join("/")} 기준 (오프라인, 갱신 실패)`;
   } else if (menu.fromCache) {
-    footerText = "dormitory.pknu.ac.kr · 오늘 캐시됨";
+    footerText = "dormitory.pknu.ac.kr · 방금 갱신 실패, 최근 데이터 표시";
   } else {
     footerText = "dormitory.pknu.ac.kr";
   }
@@ -319,7 +329,7 @@ async function createWidget(menu) {
   footer.font = Font.systemFont(9);
   footer.textColor = new Color("#636366");
  
-  // 1시간 뒤 다시 갱신 시도 (캐시가 있으면 네트워크 없이 즉시 반환됨)
+  // 매번 새로 시도하도록 짧은 간격으로 갱신 요청 (실패하면 캐시로 대체됨)
   w.refreshAfterDate = new Date(Date.now() + 60 * 60 * 1000);
  
   return w;
