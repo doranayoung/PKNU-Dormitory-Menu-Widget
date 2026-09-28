@@ -1,8 +1,8 @@
 // Variables used by Scriptable.
 // icon-color: orange; icon-glyph: utensils;
-
+ 
 /**
- * PKNU(국립부경대학교) 학생생활관 세종관 식단 위젯 — 2026 재작성판
+ * PKNU(국립부경대학교) 학생생활관 세종관 식단 위젯 — 2026 재작성판 (+캐싱)
  * -------------------------------------------------------------
  * 출처: https://dormitory.pknu.ac.kr/03_notice/notice01.php (오늘의 식단, 세종관)
  *
@@ -20,15 +20,51 @@
  * 각 끼니 칸의 메뉴는 <br /> 로 줄바꿈되어 있으며, 미운영/공백일 경우
  * 칸이 완전히 비어있다 (방학 등으로 그 주 전체가 비어있는 경우도 흔함).
  *
- * 실제 서버 응답 예시로 위 구조를 확인했고(2026-08 방학 주 = 전부 공백,
- * 2026-05 학기 중 주 = 실제 메뉴 확인), 그 구조를 기준으로 파싱한다.
+ * 실제 서버 응답 예시로 위 구조를 확인했고, 실기기(iOS)에서 정상 동작도
+ * 확인했다.
+ *
+ * ── 캐싱 ──────────────────────────────────────────────────────
+ * 위젯이 열릴 때마다 매번 크롤링하지 않도록, 오늘 날짜(KST) 기준으로
+ * 하루 한 번만 서버에 요청하고 결과를 로컬 파일에 저장해둔다. 같은 날
+ * 안에서 위젯이 다시 열리면 그 캐시를 그대로 쓰므로 인터넷 없이도 뜬다.
+ * 날짜가 바뀌면 캐시를 버리고 새로 크롤링하는데, 이때 마침 인터넷이
+ * 없으면(사용자 선택에 따라) 오래된 캐시를 보여주는 대신 "인터넷 연결
+ * 없음" 상태를 그대로 보여준다. 캐시 파일은 하나만 계속 덮어쓰는
+ * 방식이라 용량이 누적되지 않고 항상 수 KB 수준으로 고정된다.
  */
-
+ 
 const AJAX_URL = "https://dormitory.pknu.ac.kr/03_notice/req_getSchedule.php";
 const REFERER_URL = "https://dormitory.pknu.ac.kr/03_notice/notice01.php";
 // 위젯 파라미터로 다른 bid를 넘기면(예: 다른 캠퍼스 식당) 그걸 쓰고, 없으면 세종관(foodE) 기본값 사용
 const BID = (typeof args !== "undefined" && args.widgetParameter) ? args.widgetParameter : "foodE";
-
+ 
+// ---------------------------------------------------------------
+// 캐시 저장/조회 (파일 하나만 계속 덮어씀 → 용량 누적 없음)
+// ---------------------------------------------------------------
+const fm = FileManager.local();
+const CACHE_PATH = fm.joinPath(fm.documentsDirectory(), "pknu_sejong_meal_cache.json");
+ 
+function dateKeyOf(d) {
+  return `${d.year}-${d.month}-${d.day}`;
+}
+ 
+function loadCache() {
+  try {
+    if (!fm.fileExists(CACHE_PATH)) return null;
+    return JSON.parse(fm.readString(CACHE_PATH));
+  } catch (e) {
+    return null; // 캐시 파일이 깨져 있으면 그냥 없는 것처럼 취급
+  }
+}
+ 
+function saveCache(dateKey, menu) {
+  try {
+    fm.writeString(CACHE_PATH, JSON.stringify({ dateKey, menu }));
+  } catch (e) {
+    // 캐시 저장에 실패해도(저장공간 등) 위젯 자체는 계속 동작해야 하므로 무시
+  }
+}
+ 
 // ---------------------------------------------------------------
 // 유틸: 한국시간(KST) 기준 오늘 날짜
 // ---------------------------------------------------------------
@@ -49,7 +85,7 @@ function getKSTToday() {
     day: parseInt(parts.day, 10)
   };
 }
-
+ 
 // ---------------------------------------------------------------
 // AJAX 호출
 // ---------------------------------------------------------------
@@ -67,7 +103,7 @@ async function fetchScheduleHTML(vt) {
   // 그대로 두면 셀 개수가 밀리는 파싱 오류가 생긴다)
   return html.replace(/<!--[\s\S]*?-->/g, "");
 }
-
+ 
 // ---------------------------------------------------------------
 // 파싱: 헤더의 요일(M/D) 7개 추출 (일~토 순서)
 // ---------------------------------------------------------------
@@ -80,14 +116,14 @@ function parseHeaderDates(html) {
   }
   return dates;
 }
-
+ 
 // ---------------------------------------------------------------
 // 파싱: tbody 안 3개 행(아침/점심/저녁), 각 행은 [라벨, 일,월,화,수,목,금,토] 8칸
 // ---------------------------------------------------------------
 function parseMealRows(html) {
   const tbodyMatch = html.match(/<tbody>([\s\S]*?)<\/tbody>/);
   if (!tbodyMatch) return null;
-
+ 
   const rowRegex = /<tr>([\s\S]*?)<\/tr>/g;
   const rows = [];
   let rm;
@@ -102,7 +138,7 @@ function parseMealRows(html) {
   }
   return rows; // [아침행, 점심행, 저녁행], 각 행 길이 8 (라벨 포함)
 }
-
+ 
 // ---------------------------------------------------------------
 // 칸 하나(raw HTML)를 "한 줄 메뉴"로 정리
 // ---------------------------------------------------------------
@@ -118,18 +154,18 @@ function cleanCell(raw) {
     .filter((l) => l.length > 0);
   return lines.join(" · ");
 }
-
+ 
 // ---------------------------------------------------------------
-// 오늘 메뉴 가져오기 (이번 주 응답에 오늘 날짜가 없으면 이전/다음 주로 재시도)
+// 서버에서 오늘 메뉴 가져오기 (이번 주 응답에 오늘 날짜가 없으면
+// 이전/다음 주로 재시도). 네트워크 에러가 나면 그대로 throw 함.
 // ---------------------------------------------------------------
-async function getTodayMenu() {
-  const today = getKSTToday();
+async function fetchTodayMenuFromServer(today) {
   const nowVt = Math.floor(Date.now() / 1000);
-
+ 
   let html = await fetchScheduleHTML(nowVt);
   let dates = parseHeaderDates(html);
   let idx = dates.findIndex((d) => d.month === today.month && d.day === today.day);
-
+ 
   // 오늘 날짜가 이번 주 응답 헤더에 아예 없는 경우(주 경계 오차 등)에만
   // 응답에 포함된 "이전주/다음주" 버튼의 정확한 타임스탬프로 재요청
   if (idx === -1) {
@@ -137,7 +173,7 @@ async function getTodayMenu() {
     const navVts = [];
     let nm;
     while ((nm = navRegex.exec(html)) !== null) navVts.push(nm[1]);
-
+ 
     for (const vt of navVts) {
       html = await fetchScheduleHTML(vt);
       dates = parseHeaderDates(html);
@@ -145,7 +181,7 @@ async function getTodayMenu() {
       if (idx !== -1) break;
     }
   }
-
+ 
   const rows = parseMealRows(html);
   if (idx === -1 || !rows || rows.length < 3) {
     return {
@@ -156,13 +192,13 @@ async function getTodayMenu() {
       dinner: "제공 없음"
     };
   }
-
+ 
   const getMeal = (row) => {
     const cell = row && row[idx + 1]; // 0번은 라벨(아침/점심/저녁)
     const cleaned = cleanCell(cell);
     return cleaned.length > 0 ? cleaned : "제공 없음";
   };
-
+ 
   return {
     found: true,
     dateLabel: `${today.month}/${today.day}`,
@@ -171,7 +207,35 @@ async function getTodayMenu() {
     dinner: getMeal(rows[2])
   };
 }
-
+ 
+// ---------------------------------------------------------------
+// 오늘 메뉴 가져오기 (캐시 우선)
+//  - 오늘자 캐시가 있으면 네트워크 요청 없이 그대로 반환
+//  - 없으면(날짜가 바뀌었거나 최초 실행) 크롤링해서 캐시에 저장
+//  - 그 크롤링이 인터넷 문제로 실패하면 networkError 상태를 반환
+//    (오래된 캐시로 대체하지 않음 — 사용자가 선택한 동작)
+// ---------------------------------------------------------------
+async function getTodayMenu() {
+  const today = getKSTToday();
+  const todayKey = dateKeyOf(today);
+ 
+  const cached = loadCache();
+  if (cached && cached.dateKey === todayKey) {
+    return { ...cached.menu, fromCache: true };
+  }
+ 
+  try {
+    const menu = await fetchTodayMenuFromServer(today);
+    saveCache(todayKey, menu);
+    return { ...menu, fromCache: false };
+  } catch (e) {
+    return {
+      networkError: true,
+      dateLabel: `${today.month}/${today.day}`
+    };
+  }
+}
+ 
 // ---------------------------------------------------------------
 // 위젯 UI
 // ---------------------------------------------------------------
@@ -179,7 +243,7 @@ async function createWidget(menu) {
   const w = new ListWidget();
   w.backgroundColor = new Color("#1c1c1e");
   w.setPadding(14, 14, 14, 14);
-
+ 
   const titleStack = w.addStack();
   titleStack.centerAlignContent();
   const title = titleStack.addText("🍽 세종관 오늘의 식단");
@@ -189,27 +253,48 @@ async function createWidget(menu) {
   const dateText = titleStack.addText(menu.dateLabel);
   dateText.font = Font.mediumSystemFont(12);
   dateText.textColor = new Color("#8e8e93");
-
+ 
   w.addSpacer(10);
-
+ 
+  // 인터넷이 없어서 오늘자 데이터를 아예 못 받아온 경우
+  if (menu.networkError) {
+    const msg1 = w.addText("📶 인터넷 연결 없음");
+    msg1.font = Font.boldSystemFont(13);
+    msg1.textColor = Color.white();
+    w.addSpacer(4);
+    const msg2 = w.addText("오늘 식단을 아직 못 가져왔어요.\n인터넷에 연결한 뒤 다시 열어보세요.");
+    msg2.font = Font.systemFont(11);
+    msg2.textColor = new Color("#8e8e93");
+    msg2.lineLimit = 3;
+ 
+    w.addSpacer();
+    const footer = w.addText("dormitory.pknu.ac.kr");
+    footer.font = Font.systemFont(9);
+    footer.textColor = new Color("#636366");
+ 
+    // 곧 다시 시도하도록 좀 더 짧은 간격으로 재시도
+    w.refreshAfterDate = new Date(Date.now() + 15 * 60 * 1000);
+    return w;
+  }
+ 
   const meals = [
     { label: "조식", value: menu.breakfast, color: "#ffd166" },
     { label: "중식", value: menu.lunch, color: "#06d6a0" },
     { label: "석식", value: menu.dinner, color: "#ef476f" }
   ];
-
+ 
   meals.forEach((meal, i) => {
     const row = w.addStack();
     row.layoutHorizontally();
     row.topAlignContent();
-
+ 
     const badge = row.addText(meal.label);
     badge.font = Font.boldSystemFont(12);
     badge.textColor = new Color(meal.color);
     badge.leftAlignText();
-
+ 
     row.addSpacer(8);
-
+ 
     const valueStack = row.addStack();
     valueStack.layoutVertically();
     const valueText = valueStack.addText(meal.value);
@@ -217,25 +302,31 @@ async function createWidget(menu) {
     valueText.textColor = Color.white();
     valueText.lineLimit = 3;
     valueText.minimumScaleFactor = 0.7;
-
+ 
     if (i < meals.length - 1) w.addSpacer(8);
   });
-
+ 
   w.addSpacer();
-  const footer = w.addText(
-    menu.found ? "dormitory.pknu.ac.kr" : "이번 주 식단 정보 없음 (방학/미운영 가능)"
-  );
+  let footerText;
+  if (!menu.found) {
+    footerText = "이번 주 식단 정보 없음 (방학/미운영 가능)";
+  } else if (menu.fromCache) {
+    footerText = "dormitory.pknu.ac.kr · 오늘 캐시됨";
+  } else {
+    footerText = "dormitory.pknu.ac.kr";
+  }
+  const footer = w.addText(footerText);
   footer.font = Font.systemFont(9);
   footer.textColor = new Color("#636366");
-
-  // 1시간 뒤 다시 갱신 시도 (끼니 시간대에 맞춰 자연스럽게 갱신되도록)
+ 
+  // 1시간 뒤 다시 갱신 시도 (캐시가 있으면 네트워크 없이 즉시 반환됨)
   w.refreshAfterDate = new Date(Date.now() + 60 * 60 * 1000);
-
+ 
   return w;
 }
-
+ 
 // ---------------------------------------------------------------
-// 에러 위젯
+// 에러 위젯 (파싱 실패 등 네트워크 문제가 아닌 예외 상황)
 // ---------------------------------------------------------------
 function createErrorWidget(error) {
   const w = new ListWidget();
@@ -252,7 +343,7 @@ function createErrorWidget(error) {
   w.refreshAfterDate = new Date(Date.now() + 15 * 60 * 1000);
   return w;
 }
-
+ 
 // ---------------------------------------------------------------
 // 실행
 // ---------------------------------------------------------------
@@ -264,7 +355,7 @@ async function run() {
   } catch (e) {
     widget = createErrorWidget(e);
   }
-
+ 
   if (config.runsInWidget) {
     Script.setWidget(widget);
   } else {
@@ -273,5 +364,5 @@ async function run() {
   }
   Script.complete();
 }
-
+ 
 await run();
